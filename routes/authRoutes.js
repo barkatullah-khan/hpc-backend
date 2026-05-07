@@ -7,4 +7,8 @@ router.post('/login',    authController.login);
 router.post('/logout',   authController.logout);
 router.get('/me',        authController.getMe);
 
+
+// TEMPORARY - delete after use
+
+
 module.exports = router;
