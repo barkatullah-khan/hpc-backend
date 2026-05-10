@@ -10,6 +10,6 @@ router.post('/submit-job', hpcController.submitJob);
 
 router.get('/job-status', hpcController.getLiveQueue);
 
-
+router.get('/job-logs/:jobId', hpcController.getJobLogs);
 
 module.exports=router;

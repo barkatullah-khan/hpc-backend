@@ -103,3 +103,31 @@ exports.getLiveQueue = catchAsync(async (req, res, next) => {
         data: jobs
     });
 });
+
+
+// --- Add this to hpcController.js ---
+
+exports.getJobLogs = catchAsync(async (req, res, next) => {
+    const { jobId } = req.params;
+    const directoryPath = '/home/barkat/';
+
+    // 1. Read all files in the directory
+    const files = fs.readdirSync(directoryPath);
+
+    // 2. Find the file that starts with the Job ID (e.g., "103_simulation.out")
+    const logFile = files.find(file => file.startsWith(`${jobId}_`) && file.endsWith('.out'));
+
+    if (!logFile) {
+        return next(new AppError(`No log file found for Job ID ${jobId}. It might still be pending.`, 404));
+    }
+
+    const fullPath = path.join(directoryPath, logFile);
+
+    // 3. Read and send the content
+    const content = fs.readFileSync(fullPath, 'utf8');
+
+    res.status(200).json({
+        status: 'success',
+        output: content
+    });
+});
