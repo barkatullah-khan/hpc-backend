@@ -47,7 +47,10 @@ const userSchema = new mongoose.Schema({
   }
 }, {
   autoIndex: false // Helps stop that "ghost index" username error from reappearing
-});
+}
+
+
+);
 
 // --- MIDDLEWARE (HOOKS) ---
 

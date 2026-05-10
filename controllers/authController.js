@@ -44,14 +44,14 @@ const login = catchAsync(async (req, res, next) => {
   const token = jwt.sign(
     { userId: user._id, role: user.role, name: user.name },
     process.env.JWT_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: process.env.JWT_EXPIRES_IN }
   );
 
   res.cookie('token', token, {
     httpOnly: true,
     secure: false,
     sameSite: 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000
+    maxAge: process.env.JWT_COOKIE_EXPIRES_IN * 24 * 60 * 60 * 1000
   });
 
   res.status(200).json({
@@ -63,7 +63,13 @@ const login = catchAsync(async (req, res, next) => {
 
 // ─── LOGOUT ────────────────────────────────────────────────
 const logout = (req, res) => {
-  res.clearCookie('token');
+  // Pass the same options used during login (except maxAge/expires)
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: false, // matches your login setting
+    sameSite: 'lax'
+  });
+
   res.status(200).json({ 
     status: 'success',
     message: 'Logged out successfully' 

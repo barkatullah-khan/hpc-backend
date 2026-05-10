@@ -37,40 +37,42 @@ exports.getClusterStats = catchAsync(async (req, res, next) => {
 
 exports.submitJob = catchAsync(async (req, res, next) => {
     const { jobName, nodes, timeLimit } = req.body;
+    const jobIdPlaceholder = Date.now(); // Temporary ID for file naming before Slurm assigns one
+    
+    const sourcePath = '/home/barkat/hello_mpi.c';
+    const binaryPath = '/home/barkat/hello_mpi';
+    const scriptPath = `/home/barkat/${jobName}.sh`;
 
-    // Define the path within your NFS shared directory
-    const fileName = `${jobName}.sh`;
-    const filePath = path.join('/home/barkat', fileName);
+    // CORE LOGIC: Force Headnode Compilation
+    await runCommand(`source /etc/profile.d/openmpi.sh && mpicc ${sourcePath} -o ${binaryPath}`);
 
-    // This is the SLURM template
     const slurmScript = `#!/bin/bash
 #SBATCH --job-name=${jobName}
 #SBATCH --nodes=${nodes}
+#SBATCH --ntasks=${nodes}
 #SBATCH --time=${timeLimit}:00:00
 #SBATCH --output=/home/barkat/%j_${jobName}.out
 
-echo "Execution started on: $(hostname)"
-echo "Shared directory: /home/barkat"
-sleep 60
-echo "Execution finished."
+source /etc/profile.d/openmpi.sh
+echo "Job started on: $(hostname)"
+sleep 30
+mpirun --allow-run-as-root -np ${nodes} ${binaryPath}
+echo "Job finished."
 `;
 
-    // 1. Write the file to the NFS share
-    fs.writeFileSync(filePath, slurmScript);
+    fs.writeFileSync(scriptPath, slurmScript);
+    await runCommand(`chmod +x ${scriptPath}`);
     
-    // 2. Grant execution permissions (important for SLURM)
-    await runCommand(`chmod +x ${filePath}`);
-
-    // 3. Submit to the SLURM queue
-    const result = await runCommand(`sbatch ${filePath}`);
+    const result = await runCommand(`sbatch ${scriptPath}`);
+    // Extract ID: "Submitted batch job 98" -> 98
+    const jobId = result.match(/\d+/)[0]; 
 
     res.status(200).json({
         status: 'success',
-        message: 'Job submitted to cluster',
-        details: result // Returns "Submitted batch job XXXX"
+        jobId: jobId,
+        message: 'Job is now in queue'
     });
 });
-
 
 // This function gets the "Live" queue data
 exports.getLiveQueue = catchAsync(async (req, res, next) => {
