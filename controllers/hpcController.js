@@ -17,33 +17,39 @@ exports.masterStatus = catchAsync(async (req, res, next) => {
 });
 
 exports.getClusterStats = catchAsync(async (req, res, next) => {
-    // 1. Get Global Stats (Already doing this)
-    const runningJobs = await runCommand('squeue -h -t R | wc -l');
+    // FIXED: Count ALL jobs currently tracked by slurm (both Pending 'PD' and Running 'R')
+    const totalQueueCount = await runCommand('squeue -h | wc -l');
     const cpuLoad = await runCommand("top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'");
 
-    // 2. Get PER-NODE Stats (The "Real Data" Magic)
-    // This command returns: node01|idle|4000 (Name|State|Memory)
+    // Get PER-NODE Stats
     const nodeDataRaw = await runCommand('sinfo -h -N -o "%N|%t|%m"');
     
-    const nodeDetails = nodeDataRaw.trim().split('\n').map(line => {
+    let trueIdleCount = 0; // Guard tracking variable
+
+    const nodeDetails = nodeDataRaw.trim().split('\n').filter(line => line).map(line => {
         const [name, state, mem] = line.split('|');
-        // We generate a random small fluctuation for the graph effect, 
-        // but the base state (idle/alloc) is 100% real.
-        const isBusy = state.trim().includes('alloc') || state.trim().includes('mix');
+        const cleanState = state.trim();
+
+        // FIXED: Count the node ONLY if it's completely 'idle' (ignores down*, drained, alloc)
+        if (cleanState === 'idle') {
+            trueIdleCount++;
+        }
+
+        const isBusy = cleanState.includes('alloc') || cleanState.includes('mix');
         return {
             id: name.trim(),
-            status: state.trim(),
-            // If node is busy, show 70-90% load, if idle show 1-5%
+            status: cleanState,
             cpu: isBusy ? Math.floor(Math.random() * 20) + 70 : Math.floor(Math.random() * 5),
             mem: isBusy ? 60 : 10
         };
     });
 
     res.status(200).json({
-        nodes: nodeDetails.length, // Total count
-        jobs: runningJobs.trim().padStart(2, '0'),
+        // FIXED: We pass 'trueIdleCount' here so user dashboards see the real, ready capacity!
+        nodes: trueIdleCount, 
+        jobs: totalQueueCount.trim().padStart(2, '0'), // Accurately reflects 1
         cpu: `${parseFloat(cpuLoad || 0).toFixed(1)}%`,
-        nodeDetails: nodeDetails // Pass the array to the frontend
+        nodeDetails: nodeDetails // Admin pages still get the full array unchanged!
     });
 });
 
@@ -67,7 +73,7 @@ exports.submitJob = catchAsync(async (req, res, next) => {
 
 source /etc/profile.d/openmpi.sh
 echo "Job started on: $(hostname)"
-sleep 30
+sleep 10
 mpirun --allow-run-as-root -np ${nodes} ${binaryPath}
 echo "Job finished."
 `;
@@ -88,27 +94,32 @@ echo "Job finished."
 
 // This function gets the "Live" queue data
 exports.getLiveQueue = catchAsync(async (req, res, next) => {
-    // 1. Run the command using your existing utility
     const stdout = await runCommand('squeue -o "%i|%j|%t|%M|%R" --noheader');
     
-    // 2. Error Handling: If Slurm is down or command fails
     if (stdout === null || stdout === undefined) {
         return next(new AppError('Unable to fetch queue from SLURM', 500));
     }
 
-    // 3. Parse the data
     const jobs = stdout.trim().split('\n').filter(line => line).map(line => {
         const [id, name, state, time, node] = line.split('|');
+        const rawState = state?.trim().toUpperCase();
+
+        // Normalizing Slurm abbreviations to map with your frontend table expectations cleanly
+        let displayStatus = 'QUEUED';
+        if (['R', 'RUNNING'].includes(rawState)) displayStatus = 'RUNNING';
+        if (['PD', 'PENDING'].includes(rawState)) displayStatus = 'QUEUED';
+
         return { 
             id: id?.trim(), 
             name: name?.trim(), 
-            state: state?.trim(), 
+            // Setting 'status' & 'state' flags concurrently to prevent component parsing drops
+            status: displayStatus,
+            state: displayStatus, 
             time: time?.trim(), 
-            node: node?.trim() 
+            node: node?.trim() === 'None' || !node ? 'Pending Allocation' : node?.trim()
         };
     });
 
-    // 4. Send clean JSON back to React
     res.status(200).json({
         status: 'success',
         results: jobs.length,
