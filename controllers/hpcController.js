@@ -72,34 +72,51 @@ exports.getClusterStats = catchAsync(async (req, res, next) => {
 });
 
 exports.submitJob = catchAsync(async (req, res, next) => {
-    const { jobName, nodes } = req.body; // Removed manual timeLimit from request
-    const jobIdPlaceholder = Date.now(); 
+    // 1. Grab frontend form details
+    const { jobName, nodes, environment } = req.body; 
     
-    const sourcePath = '/home/barkat/hello_mpi.c';
-    const binaryPath = '/home/barkat/hello_mpi';
+    // Default file management pathways
     const scriptPath = `/home/barkat/${jobName}.sh`;
+    let runCommandString = "";
 
-    // 🌟 GENTLE ADDITION: If a file was uploaded from the browser, save it over the source path
-    if (req.file && req.file.path) {
-        const uploadedFileBuffer = fs.readFileSync(req.file.path);
-        fs.writeFileSync(sourcePath, uploadedFileBuffer);
-        
-        try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore temp cache */ }
+    // 2. Route Execution Path based on Environment Profile
+    if (environment === 'python_ml') {
+        const pythonSourcePath = `/home/barkat/${jobName}.py`;
+
+        // If a file was uploaded from the browser, write it down as a .py file
+        if (req.file && req.file.path) {
+            fs.writeFileSync(pythonSourcePath, fs.readFileSync(req.file.path));
+            try { fs.unlinkSync(req.file.path); } catch (e) {}
+        }
+        await runCommand(`chmod +x ${pythonSourcePath}`);
+
+        // Set up the mpirun execution string targeting python3
+        runCommandString = `mpirun --allow-run-as-root -np ${nodes} python3 ${pythonSourcePath}`;
+
+    } else {
+        // Default Baseline: Fallback to C/MPI compilation architecture
+        const sourcePath = '/home/barkat/hello_mpi.c';
+        const binaryPath = '/home/barkat/hello_mpi';
+
+        if (req.file && req.file.path) {
+            fs.writeFileSync(sourcePath, fs.readFileSync(req.file.path));
+            try { fs.unlinkSync(req.file.path); } catch (e) {}
+        }
+
+        // Compile the updated C file
+        await runCommand(`source /etc/profile.d/openmpi.sh && mpicc ${sourcePath} -o ${binaryPath}`);
+        await runCommand(`chmod 755 ${binaryPath}`);
+
+        runCommandString = `mpirun --allow-run-as-root -np ${nodes} ${binaryPath}`;
     }
 
-    // ⏱️ AUTOMATED TIME FOOTPRINT: Calculate a safe walltime limit (in hours)
-    // For small jobs, 1 hour (01:00:00) provides a massive, perfectly safe buffer
+    // 3. Automated safe walltime limit calculation
     let calculatedHours = 1;
-    if (nodes > 4) calculatedHours = 2; // Scaled buffer fallback if huge distributions are requested
-    
-    const safeTimeLimit = `${String(calculatedHours).padStart(2, '0')}:30:00`; // HH:MM:SS format (e.g., 01:30:00)
+    if (nodes > 4) calculatedHours = 2;
+    const safeTimeLimit = `${String(calculatedHours).padStart(2, '0')}:30:00`;
 
-    // CORE COMPILATION LOGIC: Preserved exactly
-    await runCommand(`source /etc/profile.d/openmpi.sh && mpicc ${sourcePath} -o ${binaryPath}`);
-
-    // Ensure cluster nodes can read and execute the binary
-    await runCommand(`chmod 755 ${binaryPath}`);
-
+    // 4. Generate the Slurm Script
+    // Generate the Slurm Script with explicit library path export
     const slurmScript = `#!/bin/bash
 #SBATCH --job-name=${jobName}
 #SBATCH --nodes=${nodes}
@@ -107,16 +124,20 @@ exports.submitJob = catchAsync(async (req, res, next) => {
 #SBATCH --time=${safeTimeLimit}
 #SBATCH --output=/home/barkat/%j_${jobName}.out
 
+# Load cluster environment paths
 source /etc/profile.d/openmpi.sh
 
+# Tell Python exactly where our shared VNFS library folder is
+export PYTHONPATH=/home/barkat/apps/python_libs:\$PYTHONPATH
 
-mpirun --allow-run-as-root -np ${nodes} ${binaryPath}
-echo "Job finished."
+# Run the command
+${runCommandString}
 `;
 
     fs.writeFileSync(scriptPath, slurmScript);
     await runCommand(`chmod +x ${scriptPath}`);
     
+    // 5. Fire to Slurm Queue
     const result = await runCommand(`sbatch ${scriptPath}`);
     const jobId = result.match(/\d+/)[0]; 
 
@@ -125,7 +146,7 @@ echo "Job finished."
         jobId: jobId,
         message: 'Job is now in queue'
     });
-});
+});;
 
 
 // 4. Track Live Cluster Active Execution Queue Status Array
