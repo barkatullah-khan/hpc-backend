@@ -1,11 +1,33 @@
-
+// controllers/hpcController.js
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
 const { runCommand } = require('../utils/system');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
 
+// ==========================================
+// 🛠️ MULTER DISK STORAGE ENGINE PIPELINE
+// ==========================================
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        // Fetch working directory from process environment safely, fallback to default
+        const targetDir = process.env.HPC_WORKING_DIR || '/home/barkat/';
+        cb(null, targetDir);
+    },
+    filename: (req, file, cb) => {
+        // Keeps user files cleanly organized with unique epoch timestamps
+        cb(null, `${Date.now()}-${file.originalname}`);
+    }
+});
 
+exports.uploadMiddleware = multer({ storage: storage }).single('scriptFile');
+
+// ==========================================
+// 📊 CORE CONTROLLER OPERATIONS
+// ==========================================
+
+// 1. Get Master Node Online Status
 exports.masterStatus = catchAsync(async (req, res, next) => {
     const result = await runCommand('systemctl is-active slurmctld');
     
@@ -16,21 +38,18 @@ exports.masterStatus = catchAsync(async (req, res, next) => {
     });
 });
 
+// 2. Sync Real-Time Cluster Resource Statistics
 exports.getClusterStats = catchAsync(async (req, res, next) => {
-    // FIXED: Count ALL jobs currently tracked by slurm (both Pending 'PD' and Running 'R')
     const totalQueueCount = await runCommand('squeue -h | wc -l');
     const cpuLoad = await runCommand("top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'");
-
-    // Get PER-NODE Stats
     const nodeDataRaw = await runCommand('sinfo -h -N -o "%N|%t|%m"');
     
-    let trueIdleCount = 0; // Guard tracking variable
+    let trueIdleCount = 0;
 
     const nodeDetails = nodeDataRaw.trim().split('\n').filter(line => line).map(line => {
         const [name, state, mem] = line.split('|');
         const cleanState = state.trim();
 
-        // FIXED: Count the node ONLY if it's completely 'idle' (ignores down*, drained, alloc)
         if (cleanState === 'idle') {
             trueIdleCount++;
         }
@@ -45,35 +64,52 @@ exports.getClusterStats = catchAsync(async (req, res, next) => {
     });
 
     res.status(200).json({
-        // FIXED: We pass 'trueIdleCount' here so user dashboards see the real, ready capacity!
         nodes: trueIdleCount, 
-        jobs: totalQueueCount.trim().padStart(2, '0'), // Accurately reflects 1
+        jobs: totalQueueCount.trim().padStart(2, '0'), 
         cpu: `${parseFloat(cpuLoad || 0).toFixed(1)}%`,
-        nodeDetails: nodeDetails // Admin pages still get the full array unchanged!
+        nodeDetails: nodeDetails 
     });
 });
 
 exports.submitJob = catchAsync(async (req, res, next) => {
-    const { jobName, nodes, timeLimit } = req.body;
-    const jobIdPlaceholder = Date.now(); // Temporary ID for file naming before Slurm assigns one
+    const { jobName, nodes } = req.body; // Removed manual timeLimit from request
+    const jobIdPlaceholder = Date.now(); 
     
     const sourcePath = '/home/barkat/hello_mpi.c';
     const binaryPath = '/home/barkat/hello_mpi';
     const scriptPath = `/home/barkat/${jobName}.sh`;
 
-    // CORE LOGIC: Force Headnode Compilation
+    // 🌟 GENTLE ADDITION: If a file was uploaded from the browser, save it over the source path
+    if (req.file && req.file.path) {
+        const uploadedFileBuffer = fs.readFileSync(req.file.path);
+        fs.writeFileSync(sourcePath, uploadedFileBuffer);
+        
+        try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore temp cache */ }
+    }
+
+    // ⏱️ AUTOMATED TIME FOOTPRINT: Calculate a safe walltime limit (in hours)
+    // For small jobs, 1 hour (01:00:00) provides a massive, perfectly safe buffer
+    let calculatedHours = 1;
+    if (nodes > 4) calculatedHours = 2; // Scaled buffer fallback if huge distributions are requested
+    
+    const safeTimeLimit = `${String(calculatedHours).padStart(2, '0')}:30:00`; // HH:MM:SS format (e.g., 01:30:00)
+
+    // CORE COMPILATION LOGIC: Preserved exactly
     await runCommand(`source /etc/profile.d/openmpi.sh && mpicc ${sourcePath} -o ${binaryPath}`);
+
+    // Ensure cluster nodes can read and execute the binary
+    await runCommand(`chmod 755 ${binaryPath}`);
 
     const slurmScript = `#!/bin/bash
 #SBATCH --job-name=${jobName}
 #SBATCH --nodes=${nodes}
 #SBATCH --ntasks=${nodes}
-#SBATCH --time=${timeLimit}:00:00
+#SBATCH --time=${safeTimeLimit}
 #SBATCH --output=/home/barkat/%j_${jobName}.out
 
 source /etc/profile.d/openmpi.sh
-echo "Job started on: $(hostname)"
-sleep 10
+
+
 mpirun --allow-run-as-root -np ${nodes} ${binaryPath}
 echo "Job finished."
 `;
@@ -82,7 +118,6 @@ echo "Job finished."
     await runCommand(`chmod +x ${scriptPath}`);
     
     const result = await runCommand(`sbatch ${scriptPath}`);
-    // Extract ID: "Submitted batch job 98" -> 98
     const jobId = result.match(/\d+/)[0]; 
 
     res.status(200).json({
@@ -92,19 +127,19 @@ echo "Job finished."
     });
 });
 
-// This function gets the "Live" queue data
+
+// 4. Track Live Cluster Active Execution Queue Status Array
 exports.getLiveQueue = catchAsync(async (req, res, next) => {
     const stdout = await runCommand('squeue -o "%i|%j|%t|%M|%R" --noheader');
     
-    if (stdout === null || stdout === undefined) {
-        return next(new AppError('Unable to fetch queue from SLURM', 500));
+    if (!stdout) {
+        return res.status(200).json({ status: 'success', data: [] });
     }
 
     const jobs = stdout.trim().split('\n').filter(line => line).map(line => {
         const [id, name, state, time, node] = line.split('|');
         const rawState = state?.trim().toUpperCase();
 
-        // Normalizing Slurm abbreviations to map with your frontend table expectations cleanly
         let displayStatus = 'QUEUED';
         if (['R', 'RUNNING'].includes(rawState)) displayStatus = 'RUNNING';
         if (['PD', 'PENDING'].includes(rawState)) displayStatus = 'QUEUED';
@@ -112,7 +147,6 @@ exports.getLiveQueue = catchAsync(async (req, res, next) => {
         return { 
             id: id?.trim(), 
             name: name?.trim(), 
-            // Setting 'status' & 'state' flags concurrently to prevent component parsing drops
             status: displayStatus,
             state: displayStatus, 
             time: time?.trim(), 
@@ -127,26 +161,19 @@ exports.getLiveQueue = catchAsync(async (req, res, next) => {
     });
 });
 
-
-// --- Add this to hpcController.js ---
-
+// 5. Read Slurm Cluster Output Log Trace Records
 exports.getJobLogs = catchAsync(async (req, res, next) => {
     const { jobId } = req.params;
-    const directoryPath = '/home/barkat/';
+    const workingDir = process.env.HPC_WORKING_DIR || '/home/barkat/';
 
-    // 1. Read all files in the directory
-    const files = fs.readdirSync(directoryPath);
-
-    // 2. Find the file that starts with the Job ID (e.g., "103_simulation.out")
+    const files = fs.readdirSync(workingDir);
     const logFile = files.find(file => file.startsWith(`${jobId}_`) && file.endsWith('.out'));
 
     if (!logFile) {
-        return next(new AppError(`No log file found for Job ID ${jobId}. It might still be pending.`, 404));
+        return next(new AppError(`No log tracking file found matching Job ID: ${jobId}. Still in schedule preparation queue?`, 404));
     }
 
-    const fullPath = path.join(directoryPath, logFile);
-
-    // 3. Read and send the content
+    const fullPath = path.join(workingDir, logFile);
     const content = fs.readFileSync(fullPath, 'utf8');
 
     res.status(200).json({
