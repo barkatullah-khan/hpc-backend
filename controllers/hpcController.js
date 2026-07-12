@@ -146,7 +146,7 @@ ${runCommandString}
         jobId: jobId,
         message: 'Job is now in queue'
     });
-});;
+});
 
 
 // 4. Track Live Cluster Active Execution Queue Status Array
